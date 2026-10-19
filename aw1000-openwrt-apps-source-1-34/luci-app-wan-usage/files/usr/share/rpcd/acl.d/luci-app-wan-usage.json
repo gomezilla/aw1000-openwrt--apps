@@ -1,0 +1,15 @@
+{
+	"luci-app-wan-usage": {
+		"description": "Manage WAN and cellular data usage tracking",
+		"read": {
+			"ubus": {
+				"luci.wan-usage": [ "info", "history" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.wan-usage": [ "save", "manage", "sms_test" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,300 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+
+reply_error() {
+	json_init
+	json_add_boolean ok 0
+	json_add_string error "$1"
+	json_dump
+}
+
+get_or() {
+	local value
+	value="$(uci -q get "$1" 2>/dev/null)"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$2"
+}
+
+read_state() {
+	local key="$1" field="$2"
+	awk -v n="$field" 'NR == 1 { print $n; found=1 } END { if (!found) print "" }' "/etc/wan-usage/$key.state" 2>/dev/null
+}
+
+resolve_device() {
+	local source="$1" selected
+	selected="$(get_or "wan_usage.main.${source}_interface" auto)"
+	[ "$selected" != auto ] || selected="$(/usr/libexec/wan-usage-device "$source" 2>/dev/null)"
+	printf '%s' "$selected"
+}
+
+available_device() {
+	[ -n "$1" ] && [ -r "/sys/class/net/$1/statistics/rx_bytes" ] && [ -r "/sys/class/net/$1/statistics/tx_bytes" ]
+}
+
+case "$1" in
+list)
+	cat <<'EOF'
+{
+	"info": {},
+	"history": {},
+	"manage": { "action": "string", "cycle_start": "string" },
+	"sms_test": { "phone_number": "string" },
+	"save": {
+		"source": "string",
+		"wan_interface": "string",
+		"cellular_interface": "string",
+		"wan_allowance_bytes": "string",
+		"cellular_allowance_bytes": "string",
+		"reset_day": "string",
+		"wan_warn_percent": "string",
+		"cellular_warn_percent": "string",
+		"sms_enabled": "string",
+		"phone_number": "string",
+		"cellular_cap_action": "string",
+		"history_days": "string"
+	}
+}
+EOF
+	;;
+call)
+	read -r input
+	json_load "$input"
+	case "$2" in
+	history)
+		json_init
+		json_add_array days
+		for source in wan cellular; do
+			file="/etc/wan-usage/$source-daily.csv"
+			[ -r "$file" ] || continue
+			while IFS=, read -r day down up; do
+				case "$day:$down:$up" in
+					????-??-??:[0-9]*:[0-9]*) ;;
+					*) continue ;;
+				esac
+				case "$down$up" in *[!0-9]*) continue ;; esac
+				json_add_object ""
+				json_add_string source "$source"
+				json_add_string date "$day"
+				json_add_string down_bytes "$down"
+				json_add_string up_bytes "$up"
+				json_close_object
+			done < "$file"
+		done
+		json_close_array
+		stored_bytes=0
+		pending_bytes=0
+		for file in /etc/wan-usage/wan-daily.csv /etc/wan-usage/cellular-daily.csv; do
+			[ -r "$file" ] || continue
+			size="$(wc -c < "$file" 2>/dev/null)"
+			case "$size" in *[!0-9]*|'') size=0 ;; esac
+			stored_bytes=$((stored_bytes + size))
+		done
+		mode="$(get_or wan_usage.main.source wan)"
+		for source in wan cellular; do
+			case "$mode" in both) ;; "$source") ;; *) continue ;; esac
+			state="/etc/wan-usage/$source.state"
+			[ -r "$state" ] || continue
+			read -r dev last_rx last_tx _ < "$state"
+			case "$dev:$last_rx:$last_tx" in *[!A-Za-z0-9_.:-]*) continue ;; esac
+			case "$last_rx:$last_tx" in *[!0-9:]*) continue ;; esac
+			[ -n "$last_rx" ] && [ -n "$last_tx" ] || continue
+			[ -r "/sys/class/net/$dev/statistics/rx_bytes" ] || continue
+			[ -r "/sys/class/net/$dev/statistics/tx_bytes" ] || continue
+			rx="$(cat "/sys/class/net/$dev/statistics/rx_bytes")"
+			tx="$(cat "/sys/class/net/$dev/statistics/tx_bytes")"
+			case "$last_rx:$last_tx:$rx:$tx" in *[!0-9:]*) continue ;; esac
+			[ "$rx" -lt "$last_rx" ] || pending_bytes=$((pending_bytes + rx - last_rx))
+			[ "$tx" -lt "$last_tx" ] || pending_bytes=$((pending_bytes + tx - last_tx))
+		done
+		json_add_object meta
+		json_add_int bytes "$stored_bytes"
+		json_add_int pending_bytes "$pending_bytes"
+		json_add_int sample_seconds 60
+		json_add_int write_seconds 60
+		json_close_object
+		json_add_boolean ok 1
+		json_dump
+		;;
+	sms_test)
+		json_get_var phone_number phone_number
+		message="$(/usr/sbin/wan-usage-sampler send_sms "$phone_number" "HikariWrt data usage SMS test." 2>&1)"
+		rc=$?
+		message="$(printf '%s' "$message" | tr -d '\r' | cut -c1-500)"
+		[ -n "$message" ] || message="The SMS sender exited with code $rc without returning a diagnostic. Check the system log for wan-usage entries."
+		json_init
+		json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+		json_add_string message "$message"
+		json_dump
+		;;
+	manage)
+		json_get_vars action cycle_start
+		case "$action" in reset_period|forget_all) ;; *) reply_error "Unknown history action."; exit 0 ;; esac
+		case "$cycle_start" in ????-??-??) ;; *) reply_error "Invalid billing period start date."; exit 0 ;; esac
+		case "$cycle_start" in *[!0-9-]*) reply_error "Invalid billing period start date."; exit 0 ;; esac
+		if ! mkdir /var/lock/wan-usage-sampler.lock 2>/dev/null; then
+			reply_error "The tracker is recording usage right now. Try this action again in a moment."
+			exit 0
+		fi
+		mode="$(get_or wan_usage.main.source wan)"
+		case "$action" in
+		reset_period)
+			for source in wan cellular; do
+				case "$mode" in both) ;; "$source") ;; *) continue ;; esac
+				rm -f "/etc/wan-usage/$source.state"
+				file="/etc/wan-usage/$source-daily.csv"
+				if [ -r "$file" ]; then awk -F, -v start="$cycle_start" '$1 < start { print }' "$file" > "$file.tmp" && mv "$file.tmp" "$file"; fi
+			done
+			# A manual period restart explicitly releases a cellular allowance hold.
+			if [ -r /etc/wan-usage/cellular-stopped-cycle ]; then
+				for iface in wwan wwan_4 wwan_6; do ifup "$iface" >/dev/null 2>&1; done
+				rm -f /etc/wan-usage/cellular-stopped-cycle
+			fi
+			;;
+		forget_all)
+			rm -f /etc/wan-usage/wan.state /etc/wan-usage/cellular.state
+			rm -f /etc/wan-usage/wan-daily.csv /etc/wan-usage/cellular-daily.csv
+			if [ -r /etc/wan-usage/cellular-stopped-cycle ]; then
+				for iface in wwan wwan_4 wwan_6; do ifup "$iface" >/dev/null 2>&1; done
+				rm -f /etc/wan-usage/cellular-stopped-cycle
+			fi
+			;;
+		esac
+		rmdir /var/lock/wan-usage-sampler.lock 2>/dev/null
+		mkdir -p /etc/wan-usage
+		[ "$action" != reset_period ] || /usr/sbin/wan-usage-sampler sample >/dev/null 2>&1
+		json_init
+		json_add_boolean ok 1
+		json_dump
+		;;
+	info)
+		mode="$(get_or wan_usage.main.source wan)"
+		wan_device="$(resolve_device wan)"
+		cell_device="$(resolve_device cellular)"
+		wan_config_iface="$(uci -q get wan_usage.main.wan_interface 2>/dev/null)"
+		cell_config_iface="$(uci -q get wan_usage.main.cellular_interface 2>/dev/null)"
+		[ -n "$wan_config_iface" ] || { [ "$mode" = wan ] && wan_config_iface="$(get_or wan_usage.main.interface auto)"; }
+		[ -n "$cell_config_iface" ] || { [ "$mode" = cellular ] && cell_config_iface="$(get_or wan_usage.main.interface auto)"; }
+		wan_config_iface="${wan_config_iface:-auto}"
+		cell_config_iface="${cell_config_iface:-auto}"
+		wan_allowance="$(uci -q get wan_usage.main.wan_allowance_bytes 2>/dev/null)"
+		cell_allowance="$(uci -q get wan_usage.main.cellular_allowance_bytes 2>/dev/null)"
+		wan_warn="$(uci -q get wan_usage.main.wan_warn_percent 2>/dev/null)"
+		cell_warn="$(uci -q get wan_usage.main.cellular_warn_percent 2>/dev/null)"
+		[ -n "$wan_allowance" ] || { [ "$mode" = wan ] && wan_allowance="$(get_or wan_usage.main.allowance_bytes 0)"; }
+		[ -n "$cell_allowance" ] || { [ "$mode" = cellular ] && cell_allowance="$(get_or wan_usage.main.allowance_bytes 0)"; }
+		[ -n "$wan_warn" ] || { [ "$mode" = wan ] && wan_warn="$(get_or wan_usage.main.warn_percent 80)"; }
+		[ -n "$cell_warn" ] || { [ "$mode" = cellular ] && cell_warn="$(get_or wan_usage.main.warn_percent 80)"; }
+		wan_allowance="${wan_allowance:-0}"
+		cell_allowance="${cell_allowance:-0}"
+		wan_warn="${wan_warn:-80}"
+		cell_warn="${cell_warn:-80}"
+		json_init
+		json_add_string source "$mode"
+		json_add_string wan_device "$(/usr/libexec/wan-usage-device wan 2>/dev/null)"
+		json_add_string cellular_device "$(/usr/libexec/wan-usage-device cellular 2>/dev/null)"
+		json_add_string wan_interface "$wan_config_iface"
+		json_add_string cellular_interface "$cell_config_iface"
+		json_add_string wan_allowance_bytes "$wan_allowance"
+		json_add_string cellular_allowance_bytes "$cell_allowance"
+		json_add_string wan_warn_percent "$wan_warn"
+		json_add_string cellular_warn_percent "$cell_warn"
+		json_add_string wan_used_bytes "$(read_state wan 5)"
+		json_add_string cellular_used_bytes "$(read_state cellular 5)"
+		json_add_string wan_tracked_device "$(read_state wan 1)"
+		json_add_string cellular_tracked_device "$(read_state cellular 1)"
+		if available_device "$wan_device"; then json_add_boolean wan_available 1; else json_add_boolean wan_available 0; fi
+		if available_device "$cell_device"; then json_add_boolean cellular_available 1; else json_add_boolean cellular_available 0; fi
+		# Keep legacy fields for older LuCI views and state migration.
+		case "$mode" in cellular) primary=cellular ;; *) primary=wan ;; esac
+		if [ "$primary" = cellular ]; then
+			json_add_string interface "$cell_device"
+			json_add_string allowance_bytes "$cell_allowance"
+			json_add_string warn_percent "$cell_warn"
+			json_add_string tracked_device "$(read_state cellular 1)"
+			json_add_string used_bytes "$(read_state cellular 5)"
+			if available_device "$cell_device"; then json_add_boolean available 1; else json_add_boolean available 0; fi
+		else
+			json_add_string interface "$wan_device"
+			json_add_string allowance_bytes "$wan_allowance"
+			json_add_string warn_percent "$wan_warn"
+			json_add_string tracked_device "$(read_state wan 1)"
+			json_add_string used_bytes "$(read_state wan 5)"
+			if available_device "$wan_device"; then json_add_boolean available 1; else json_add_boolean available 0; fi
+		fi
+		json_add_string reset_day "$(get_or wan_usage.main.reset_day 1)"
+		json_add_string sms_enabled "$(get_or wan_usage.main.sms_enabled 0)"
+		json_add_string phone_number "$(get_or wan_usage.main.phone_number '')"
+		json_add_string cellular_cap_action "$(get_or wan_usage.main.cellular_cap_action none)"
+		json_add_string history_days "$(get_or wan_usage.main.history_days 400)"
+		json_add_array interfaces
+		for path in /sys/class/net/*; do
+			[ -e "$path" ] || continue
+			dev="${path##*/}"
+			[ "$dev" = lo ] && continue
+			json_add_string "" "$dev"
+		done
+		json_add_boolean ok 1
+		json_dump
+		;;
+	save)
+		json_get_vars source wan_interface cellular_interface wan_allowance_bytes cellular_allowance_bytes reset_day wan_warn_percent cellular_warn_percent sms_enabled phone_number cellular_cap_action history_days
+		case "$source" in wan|cellular|both) ;; *) reply_error "Choose WAN, cellular, or both."; exit 0 ;; esac
+		for iface in "$wan_interface" "$cellular_interface"; do
+			case "$iface" in auto) ;; ''|*[!A-Za-z0-9_.:-]*) reply_error "Choose a valid network interface for each link."; exit 0 ;; esac
+		done
+		for bytes in "$wan_allowance_bytes" "$cellular_allowance_bytes"; do
+			case "$bytes" in ''|*[!0-9]*) reply_error "Enter a non-negative data allowance for each link."; exit 0 ;; esac
+		done
+		case "$reset_day" in ''|*[!0-9]*) reply_error "Choose a reset day from 1 to 31."; exit 0 ;; esac
+		[ "$reset_day" -ge 1 ] && [ "$reset_day" -le 31 ] || { reply_error "Choose a reset day from 1 to 31."; exit 0; }
+		for p in "$wan_warn_percent" "$cellular_warn_percent"; do
+			case "$p" in ''|*[!0-9]*) reply_error "Choose warning levels from 1 to 99 percent."; exit 0 ;; esac
+			[ "$p" -ge 1 ] && [ "$p" -le 99 ] || { reply_error "Choose warning levels from 1 to 99 percent."; exit 0; }
+		done
+		case "$sms_enabled" in 0|1) ;; *) reply_error "Choose whether SMS alerts are enabled."; exit 0 ;; esac
+		case "$cellular_cap_action" in none|stop) ;; *) reply_error "Choose what to do when the cellular allowance is reached."; exit 0 ;; esac
+		case "$history_days" in ''|*[!0-9]*) reply_error "Enter a history retention from 1 to 3650 days."; exit 0 ;; esac
+		[ "$history_days" -ge 1 ] && [ "$history_days" -le 3650 ] || { reply_error "Enter a history retention from 1 to 3650 days."; exit 0; }
+		if [ -n "$phone_number" ]; then
+			phone_number="$(printf '%s' "$phone_number" | tr -d '[:space:]().-')"
+			case "$phone_number" in +*) phone_number="${phone_number#+}" ;; esac
+			case "$phone_number" in 00*) phone_number="${phone_number#00}" ;; esac
+			case "$phone_number" in *[!0-9]*) reply_error "Enter the phone number as international digits without a leading +."; exit 0 ;; esac
+			case "$phone_number" in 0*)
+				country_code="$(uci -q get aw1000_modem.sms.country_code | tr -cd '0-9')"
+				[ -n "$country_code" ] || { reply_error "Enter international digits without +, or set the modem country code before using a local number."; exit 0; }
+				phone_number="${country_code}${phone_number#0}"
+				;;
+			esac
+			case "$phone_number" in ''|*[!0-9]*) reply_error "Enter an international phone number using digits only."; exit 0 ;; esac
+			[ "${#phone_number}" -le 15 ] || { reply_error "Use an international number with no more than 15 digits."; exit 0; }
+			[ "${#phone_number}" -ge 7 ] || { reply_error "Enter a complete mobile number with country code."; exit 0; }
+		fi
+		[ "$sms_enabled" != 1 ] || [ -n "$phone_number" ] || { reply_error "Enter a phone number to enable SMS alerts."; exit 0; }
+		uci set wan_usage.main.source="$source"
+		uci set wan_usage.main.wan_interface="$wan_interface"
+		uci set wan_usage.main.cellular_interface="$cellular_interface"
+		uci set wan_usage.main.wan_allowance_bytes="$wan_allowance_bytes"
+		uci set wan_usage.main.cellular_allowance_bytes="$cellular_allowance_bytes"
+		uci set wan_usage.main.wan_warn_percent="$wan_warn_percent"
+		uci set wan_usage.main.cellular_warn_percent="$cellular_warn_percent"
+		uci set wan_usage.main.reset_day="$reset_day"
+		uci set wan_usage.main.sms_enabled="$sms_enabled"
+		uci set wan_usage.main.phone_number="$phone_number"
+		uci set wan_usage.main.cellular_cap_action="$cellular_cap_action"
+		uci set wan_usage.main.history_days="$history_days"
+		# Mirror the selected single link into legacy keys for safe rollback.
+		case "$source" in
+			wan) uci set wan_usage.main.interface="$wan_interface"; uci set wan_usage.main.allowance_bytes="$wan_allowance_bytes"; uci set wan_usage.main.warn_percent="$wan_warn_percent" ;;
+			cellular) uci set wan_usage.main.interface="$cellular_interface"; uci set wan_usage.main.allowance_bytes="$cellular_allowance_bytes"; uci set wan_usage.main.warn_percent="$cellular_warn_percent" ;;
+		esac
+		uci commit wan_usage
+		/etc/init.d/wan-usage-tracker restart >/dev/null 2>&1
+		json_init
+		json_add_boolean ok 1
+		json_dump
+		;;
+	*) reply_error "Unknown method." ;;
+	esac
+	;;
+*) exit 1 ;;
+esac

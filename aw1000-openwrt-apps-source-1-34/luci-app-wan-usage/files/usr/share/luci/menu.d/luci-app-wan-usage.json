@@ -1,0 +1,13 @@
+{
+	"admin/services/wan-usage": {
+		"title": "Data Usage",
+		"order": 88,
+		"action": {
+			"type": "view",
+			"path": "wan-usage/index"
+		},
+		"depends": {
+			"acl": [ "luci-app-wan-usage" ]
+		}
+	}
+}

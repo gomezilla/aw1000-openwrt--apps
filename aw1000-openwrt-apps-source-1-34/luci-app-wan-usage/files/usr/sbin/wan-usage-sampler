@@ -1,0 +1,338 @@
+#!/bin/sh
+# Persist independent byte counters and alert state for each link.
+LOCK=/var/lock/wan-usage-sampler.lock
+
+days_in_month() {
+	local year="$1" month="$2"
+	case "$month" in
+		01|03|05|07|08|10|12) echo 31 ;;
+		04|06|09|11) echo 30 ;;
+		02)
+			if [ $((year % 400)) -eq 0 ] || { [ $((year % 4)) -eq 0 ] && [ $((year % 100)) -ne 0 ]; }; then
+				echo 29
+			else
+				echo 28
+			fi
+			;;
+		*) echo 31 ;;
+	esac
+}
+
+cycle_key() {
+	local year month day reset
+	year="$(date +%Y)"
+	month="$(date +%m)"
+	day="$(date +%d)"
+	reset="$(uci -q get wan_usage.main.reset_day)"
+	reset="${reset:-1}"
+	month_days="$(days_in_month "$year" "$month")"
+	[ "$reset" -le "$month_days" ] || reset="$month_days"
+	if [ "$day" -lt "$reset" ]; then
+		if [ "$month" = 01 ]; then
+			year=$((year - 1))
+			month=12
+		else
+			month=$(printf '%d' "$month")
+			month=$((month - 1))
+			[ "$month" -ge 10 ] || month="0$month"
+		fi
+		month_days="$(days_in_month "$year" "$month")"
+		[ "$reset" -le "$month_days" ] || reset="$month_days"
+	fi
+	printf '%04d%02d%02d\n' "$year" "$month" "$reset"
+}
+
+cellular_down() {
+	for iface in wwan_4 wwan_6 wwan; do
+		ifdown "$iface" >/dev/null 2>&1
+	done
+}
+
+cellular_up() {
+	for iface in wwan wwan_4 wwan_6; do
+		ifup "$iface" >/dev/null 2>&1
+	done
+}
+
+# Return 0 while the monthly cellular cap is holding the data interfaces down.
+enforce_cellular_cap() {
+	local marker saved_cycle current_cycle mode action
+	marker=/etc/wan-usage/cellular-stopped-cycle
+	[ -r "$marker" ] || return 1
+	saved_cycle="$(cat "$marker" 2>/dev/null)"
+	current_cycle="$(cycle_key)"
+	mode="$(uci -q get wan_usage.main.source)"
+	action="$(uci -q get wan_usage.main.cellular_cap_action)"
+	if [ "$saved_cycle" != "$current_cycle" ] || [ "$action" != stop ] || { [ "$mode" != cellular ] && [ "$mode" != both ]; }; then
+		cellular_up
+		rm -f "$marker"
+		logger -t wan-usage "cellular data re-enabled at billing period reset or after disabling the cap action"
+		return 1
+	fi
+	cellular_down
+	return 0
+}
+
+valid_device() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+	[ -r "/sys/class/net/$1/statistics/rx_bytes" ] && [ -r "/sys/class/net/$1/statistics/tx_bytes" ]
+}
+
+sample_source() {
+	local source="$1" device rx tx cycle old_device old_rx old_tx old_cycle total delta
+	local delta_rx delta_tx today daily retention cap_action
+	local warn_sent cap_sent warn_try cap_try allowance warn_percent phone sms_enabled now source_label state
+	local iface_option allowance_option warn_option
+	state="/etc/wan-usage/$source.state"
+	iface_option="${source}_interface"
+	allowance_option="${source}_allowance_bytes"
+	warn_option="${source}_warn_percent"
+	device="$(uci -q get "wan_usage.main.$iface_option")"
+	[ -n "$device" ] || { [ "$(uci -q get wan_usage.main.source)" = "$source" ] && device="$(uci -q get wan_usage.main.interface)"; }
+	[ -n "$device" ] || device=auto
+	[ "$device" = auto ] && device="$(/usr/libexec/wan-usage-device "$source" 2>/dev/null)"
+	cycle="$(cycle_key)"
+	mkdir -p /etc/wan-usage
+	if [ ! -r "$state" ] && [ -r /etc/wan-usage/state ] && [ "$(uci -q get wan_usage.main.source)" = "$source" ]; then
+		cp /etc/wan-usage/state "$state"
+		logger -t wan-usage "migrated existing usage total to $source tracker"
+	fi
+	[ -r "$state" ] || : > "$state"
+	read -r old_device old_rx old_tx old_cycle total warn_sent cap_sent warn_try cap_try < "$state"
+	case "$old_rx$old_tx$total" in *[!0-9]*) old_rx=0; old_tx=0; total=0 ;; esac
+	[ -n "$total" ] || total=0
+	case "$warn_sent$cap_sent$warn_try$cap_try" in *[!0-9]*) warn_sent=0; cap_sent=0; warn_try=0; cap_try=0 ;; esac
+	[ -n "$warn_sent" ] || warn_sent=0
+	[ -n "$cap_sent" ] || cap_sent=0
+	[ -n "$warn_try" ] || warn_try=0
+	[ -n "$cap_try" ] || cap_try=0
+	if ! valid_device "$device"; then
+		logger -t wan-usage "$source interface is unavailable; retaining current total"
+		return 0
+	fi
+	rx="$(cat "/sys/class/net/$device/statistics/rx_bytes")"
+	tx="$(cat "/sys/class/net/$device/statistics/tx_bytes")"
+	case "$rx$tx" in *[!0-9]*|'') return 1 ;; esac
+
+	if [ "$cycle" != "$old_cycle" ]; then
+		# The previous release keyed periods only by calendar month. Preserve its
+		# in-progress total when upgrading within the same month, then migrate to
+		# the exact reset-day key without counting the device's lifetime counters.
+		if [ "${#old_cycle}" = 6 ] && [ "$old_cycle" = "$(date +%Y%m)" ] && [ "${cycle%??}" = "$old_cycle" ]; then
+			old_cycle="$cycle"
+			old_rx="$rx"
+			old_tx="$tx"
+			logger -t wan-usage "migrated monthly usage state to the configured billing reset day"
+		else
+		total=0
+		old_rx="$rx"
+		old_tx="$tx"
+		delta_rx=0
+		delta_tx=0
+		warn_sent=0
+		cap_sent=0
+		warn_try=0
+		cap_try=0
+		fi
+	elif [ "$device" != "$old_device" ]; then
+		# Preserve the period total across automatic interface changes, but
+		# establish a fresh baseline so counters from different devices do not mix.
+		old_rx="$rx"
+		old_tx="$tx"
+		delta_rx=0
+		delta_tx=0
+	else
+		# Counter drops indicate an interface reset or reboot: count from zero.
+		if [ "$rx" -ge "$old_rx" ] 2>/dev/null; then delta_rx=$((rx - old_rx)); else delta_rx="$rx"; fi
+		total=$((total + delta_rx))
+		if [ "$tx" -ge "$old_tx" ] 2>/dev/null; then delta_tx=$((tx - old_tx)); else delta_tx="$tx"; fi
+		total=$((total + delta_tx))
+	fi
+
+	# Keep a daily row (including zero-use days) for the Overview and History tabs.
+	today="$(date +%Y-%m-%d)"
+	daily="/etc/wan-usage/$source-daily.csv"
+	retention="$(uci -q get wan_usage.main.history_days)"
+	case "$retention" in ''|*[!0-9]*) retention=400 ;; esac
+	[ "$retention" -ge 1 ] 2>/dev/null || retention=400
+	[ "$retention" -le 3650 ] 2>/dev/null || retention=400
+	mkdir -p /etc/wan-usage
+	if [ -r "$daily" ]; then
+		awk -F, -v day="$today" -v down="${delta_rx:-0}" -v up="${delta_tx:-0}" '
+			BEGIN { OFS=","; found=0 }
+			$1 == day { $2 += down; $3 += up; found=1 }
+			{ print }
+			END { if (!found) print day, down, up }
+		' "$daily" > "$daily.tmp"
+	else
+		printf '%s,%s,%s\n' "$today" "${delta_rx:-0}" "${delta_tx:-0}" > "$daily.tmp"
+	fi
+	mv "$daily.tmp" "$daily"
+	tail -n "$retention" "$daily" > "$daily.tmp"
+	mv "$daily.tmp" "$daily"
+
+	# Send each threshold alert once per billing cycle. Failed SMS attempts are
+	# retried no more than every 30 minutes, which lets a detached modem recover
+	# without flooding logs or the SMS gateway.
+	allowance="$(uci -q get "wan_usage.main.$allowance_option")"
+	warn_percent="$(uci -q get "wan_usage.main.$warn_option")"
+	if [ -z "$allowance" ] && [ "$(uci -q get wan_usage.main.source)" = "$source" ]; then allowance="$(uci -q get wan_usage.main.allowance_bytes)"; fi
+	if [ -z "$warn_percent" ] && [ "$(uci -q get wan_usage.main.source)" = "$source" ]; then warn_percent="$(uci -q get wan_usage.main.warn_percent)"; fi
+	phone="$(uci -q get wan_usage.main.phone_number)"
+	sms_enabled="$(uci -q get wan_usage.main.sms_enabled)"
+	case "$source" in cellular) source_label="Cellular" ;; *) source_label="WAN" ;; esac
+	if [ "$sms_enabled" = 1 ] && [ -n "$phone" ] && [ "${allowance:-0}" -gt 0 ] 2>/dev/null; then
+		now="$(date +%s)"
+		if [ "$warn_sent" != 1 ] && [ "$total" -ge $((allowance * warn_percent / 100)) ] && [ $((now - warn_try)) -ge 1800 ]; then
+			warn_try="$now"
+			if send_sms "$phone" "$source_label: $(format_usage "$total") used of $(format_usage "$allowance") (${warn_percent}% warning)."; then
+				warn_sent=1
+				logger -t wan-usage "warning SMS sent"
+			else
+				logger -t wan-usage "warning SMS failed; will retry later"
+			fi
+		fi
+		if [ "$cap_sent" != 1 ] && [ "$total" -ge "$allowance" ] && [ $((now - cap_try)) -ge 1800 ]; then
+			cap_try="$now"
+			if send_sms "$phone" "$source_label limit: $(format_usage "$total") used of $(format_usage "$allowance")."; then
+				cap_sent=1
+				logger -t wan-usage "allowance SMS sent"
+			else
+				logger -t wan-usage "allowance SMS failed; will retry later"
+			fi
+		fi
+	fi
+
+	printf '%s %s %s %s %s %s %s %s %s\n' "$device" "$rx" "$tx" "$cycle" "$total" "$warn_sent" "$cap_sent" "$warn_try" "$cap_try" > "$state.tmp"
+	mv "$state.tmp" "$state"
+	cap_action="$(uci -q get wan_usage.main.cellular_cap_action)"
+	if [ "$source" = cellular ] && [ "$cap_action" = stop ] && [ "${allowance:-0}" -gt 0 ] 2>/dev/null && [ "$total" -ge "$allowance" ] 2>/dev/null && [ ! -r /etc/wan-usage/cellular-stopped-cycle ]; then
+		printf '%s\n' "$cycle" > /etc/wan-usage/cellular-stopped-cycle
+		cellular_down
+		logger -t wan-usage "cellular data stopped because the configured monthly allowance was reached"
+	fi
+}
+
+sample_once() {
+	local mode blocked
+	mode="$(uci -q get wan_usage.main.source)"
+	if enforce_cellular_cap; then blocked=1; else blocked=0; fi
+	case "$mode" in
+		both) sample_source wan; [ "$blocked" = 1 ] || sample_source cellular ;;
+		wan) sample_source wan ;;
+		cellular) [ "$blocked" = 1 ] || sample_source cellular ;;
+		*) logger -t wan-usage "invalid tracking mode '$mode'"; return 1 ;;
+	esac
+}
+
+format_usage() {
+	awk -v bytes="$1" 'BEGIN { if (bytes >= 1e12) printf "%.2f TB", bytes / 1e12; else if (bytes >= 1e9) printf "%.2f GB", bytes / 1e9; else if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824; else printf "%.0f MB", bytes / 1e6 }'
+}
+
+find_exec() {
+	local name candidate
+	name="$1"
+	candidate="$(command -v "$name" 2>/dev/null)"
+	[ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+	for candidate in "/usr/bin/$name" "/usr/sbin/$name" "/bin/$name" "/sbin/$name"; do
+		[ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+	done
+	return 1
+}
+
+modem_at_port() {
+	local interface t d readlink_bin cat_bin vendor_product
+	interface="$1"
+	if [ -x /usr/sbin/aw1000-modem-ports ]; then
+		/usr/sbin/aw1000-modem-ports port "$interface"
+		return $?
+	fi
+
+	# The AW1000 defaults package normally provides this lookup. Keep the SMS
+	# feature working without that package by using the same USB interface map.
+	readlink_bin="$(find_exec readlink)"
+	cat_bin="$(find_exec cat)"
+	[ -n "$readlink_bin" ] && [ -n "$cat_bin" ] || return 1
+	for t in /sys/class/tty/ttyUSB*; do
+		[ -e "$t/device" ] || continue
+		d="$("$readlink_bin" -f "$t/device")/.."
+		vendor_product="$("$cat_bin" "$d/../idVendor" 2>/dev/null):$("$cat_bin" "$d/../idProduct" 2>/dev/null)"
+		[ "$vendor_product" = '2c7c:0800' ] || continue
+		[ "$("$cat_bin" "$d/bInterfaceNumber" 2>/dev/null)" = "$interface" ] && {
+			printf '/dev/%s\n' "${t##*/}"
+			return 0
+		}
+	done
+	return 1
+}
+
+send_sms() {
+	local number="$1" message="$2" prefix port rc output sms_bin flock_bin missing
+	number="$(printf '%s' "$number" | tr -d '[:space:]().-')"
+	case "$number" in +*) number="${number#+}" ;; esac
+	case "$number" in 00*) number="${number#00}" ;; esac
+	case "$number" in 0*)
+		prefix="$(uci -q get aw1000_modem.sms.country_code | tr -cd '0-9')"
+		[ -n "$prefix" ] || { logger -t wan-usage "SMS needs the modem country code for a local phone number"; return 1; }
+		number="${prefix}${number#0}"
+		;;
+	esac
+	case "$number" in ''|*[!0-9]*) logger -t wan-usage "SMS recipient is not international digits"; return 1 ;; esac
+	[ "${#number}" -ge 7 ] && [ "${#number}" -le 15 ] || { logger -t wan-usage "SMS recipient length is invalid"; return 1; }
+	# sms_tool expects the international country-code digits without a leading plus.
+	port="$(modem_at_port 02 2>/dev/null)"
+	sms_bin="$(find_exec sms_tool)"
+	flock_bin="$(find_exec flock)"
+	missing=""
+	[ -n "$sms_bin" ] || missing="$missing sms_tool (package sms-tool);"
+	[ -n "$flock_bin" ] || missing="$missing flock (package flock);"
+	if [ -n "$missing" ]; then
+		logger -t wan-usage "SMS unavailable; missing:$missing"
+		printf 'Missing SMS component(s):%s Install or restore the listed package(s).\n' "$missing"
+		return 1
+	fi
+	[ -n "$port" ] || { logger -t wan-usage "SMS modem AT port interface 02 was not found; delivery will be retried"; printf '%s\n' 'The AW1000 modem AT port for USB interface 02 could not be located.'; return 1; }
+	# Share the modem lock with Modem > SMS, so an alert cannot interrupt an
+	# AT command or another SMS in progress.
+	output="$("$flock_bin" /var/lock/aw1000-modem.lock "$sms_bin" -d "$port" send "$number" "$message" 2>&1)"
+	rc=$?
+	output="$(printf '%s' "$output" | tr -d '\r' | cut -c1-300)"
+	# sms_tool may report CMS 350 after the modem accepted and delivered the
+	# message. Treat that specific no-response result as uncertain-but-submitted
+	# to avoid sending the same allowance alert again on the next retry.
+	case "$output" in
+	*"code: 350 No response from modem"*)
+		logger -t wan-usage "SMS submission outcome uncertain on $port (CMS 350); suppressing retries to avoid duplicate alerts"
+		printf '%s\n' 'The modem returned code 350 without confirming the SMS. It may still have been sent; check your phone. This alert will not be retried to avoid duplicate texts.'
+		return 0
+		;;
+	esac
+	if [ "$rc" = 0 ]; then
+		logger -t wan-usage "SMS submission accepted by modem; reply: ${output:-no diagnostic output}; carrier delivery is not confirmed"
+		printf '%s\n' "The modem accepted the SMS submission${output:+: $output}. Carrier delivery is not confirmed."
+		return 0
+	fi
+	logger -t wan-usage "SMS tool failed (exit $rc) on $port; ${output:-no diagnostic output}; delivery will be retried"
+	printf '%s\n' "SMS send failed (exit $rc on $port)${output:+: $output}. The alert will retry later."
+	return 1
+}
+
+daemon() {
+	trap 'if mkdir "$LOCK" 2>/dev/null; then sample_once; rmdir "$LOCK"; fi; exit 0' TERM INT
+	while :; do
+		if mkdir "$LOCK" 2>/dev/null; then
+			sample_once
+			rmdir "$LOCK"
+		fi
+		sleep 60
+	done
+}
+
+case "$1" in
+sample) if mkdir "$LOCK" 2>/dev/null; then sample_once; rmdir "$LOCK"; fi ;;
+send_sms) [ "$#" -eq 3 ] || { echo 'usage: wan-usage-sampler send_sms <number> <message>' >&2; exit 2; }; send_sms "$2" "$3" ;;
+daemon) daemon ;;
+*) echo "usage: $0 {sample|daemon|send_sms}" >&2; exit 2 ;;
+esac

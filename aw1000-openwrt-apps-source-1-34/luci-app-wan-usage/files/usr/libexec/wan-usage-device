@@ -1,0 +1,48 @@
+#!/bin/sh
+# Resolve a logical source to the Linux device carrying its traffic.
+source="$1"
+
+valid_device() {
+	case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+	[ -r "/sys/class/net/$1/statistics/rx_bytes" ] && [ -r "/sys/class/net/$1/statistics/tx_bytes" ]
+}
+
+from_status() {
+	local status dev
+	status="$(ubus call "network.interface.$1" status 2>/dev/null)" || return 1
+	case "$1" in
+		wwan_4|wwan_6) keys='l3_device device' ;;
+		*) keys='l3_device device' ;;
+	esac
+	for key in $keys; do
+		dev="$(jsonfilter -s "$status" -e "@.$key" 2>/dev/null | head -n 1)"
+		if valid_device "$dev"; then
+			echo "$dev"
+			return 0
+		fi
+	done
+	return 1
+}
+
+case "$source" in
+wan)
+	from_status wan || from_status wan_4 || {
+		dev="$(uci -q get network.wan.device)"
+		valid_device "$dev" && echo "$dev"
+	}
+	;;
+cellular)
+	# AW1000 config commonly places IPv4/IPv6 on wwan_4/wwan_6 over
+	# wwan0_1. Prefer l3_device because device may name the modem's base
+	# netdev (wwan0), while l3_device carries the routed traffic.
+	# Check the runtime devices first, then the modem's base logical
+	# interface and finally conventional WWAN netdev names.
+	from_status wwan_4 || from_status wwan_6 || from_status wwan || {
+		for path in /sys/class/net/wwan[0-9]* /sys/class/net/rmnet*; do
+			[ -e "$path" ] || continue
+			dev="${path##*/}"
+			if valid_device "$dev"; then echo "$dev"; exit 0; fi
+		done
+	}
+	;;
+esac
